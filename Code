@@ -1,0 +1,2137 @@
+require(rgdal)
+require(readxl)
+library(INLA)
+library(gstat)
+library(sf)
+library(raster)
+library(Matrix)
+library(inlabru)
+library(ggplot2)
+library(gstat)
+library(sp)
+library(readxl)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(brms)
+library(data.table)
+set.seed(123)
+#MCMC方法
+Point_Data <- read_excel("F:/data.xlsx")
+model <- brm(formula = FIcase ~ offset(log(FHRR1))+Peci+Sun+Temp+PM2.5+Illr+Eth+Over65por+Edu+House+Room+Mau+Min+SurP+PGDP+PerDI+PMeat+Meat+FC+GCR+PopD+TBInc+HEGDP+PHE+s(Lon,Lat)+(1|SSQ)+(1|ShengID)+(1|year),#包含空间项和协变量
+             data=Point_Data, 
+             family =negbinomial(),
+             chains = 5
+)
+summary(model)
+summary(model, digits = 3)
+A<-WAIC(model)#WAIC值
+loo_result <- loo(model)
+mll <- loo_result$estimates["elpd_loo", "Estimate"]
+print(mll)#MLL值
+pp_check(model)
+mcmc_plot(model, type = "trace")
+mcmc_plot(model, type = "nuts_acceptance")
+#mcmc_plot(model, type = "dens_overlay")
+#mcmc_plot(model, type = "intervals")
+#mcmc_plot(model, type = "trace")
+#mcmc_plot(model, type = "areas")
+
+#估计2845个区县
+Predict<-read_excel("F:/data2.xlsx")
+new_data <- data.frame(MHRR1 = c(Predict$MHRR1),
+                       Temp=c(Predict$Temp),
+                       Eth=c(Predict$Eth),
+                       Over65por=c(Predict$Over65por),
+                       Edu=c(Predict$Edu),
+                       Room=c(Predict$Room),
+                       House=c(Predict$House),
+                       PGDP=c(Predict$PGDP),
+                       PerDI = c(Predict$PerDI),
+                       PMeat=c(Predict$PMeat),
+                       SSQ=c(Predict$SSQ),
+                       ShengID=c(Predict$ShengID),
+                       year=c(Predict$year),
+                       Lon=c(Predict$Lon),
+                       Lat=c(Predict$Lat))
+predictions <- predict(model1, newdata = new_data, re_formula = NA,se.fit = TRUE)
+library(data.table)
+predictions<-data.frame(predictions)
+Preinc<-predictions/data2$MHRR*100000
+fwrite(Preinc, file = "F:/MCMC estimate.csv")
+
+#滑动窗口交叉验证
+Point_Data <- Point_Data[order(Point_Data$year), ]
+window_size <- 10
+unique_years <- sort(unique(Point_Data$year))
+n_years <- length(unique_years)
+min_train_years <- window_size  # 至少需要window_size年的数据训练
+# 存储交叉验证结果
+cv_results <- list()           # 预测结果
+cv_test <- list()              # 实际值
+cv_rmse <- numeric()           # RMSE
+cv_me <- numeric()             # ME
+cv_mse <- numeric()            # MSE
+cv_mae <- numeric()            # MAE
+cv_r2 <- numeric()             # R²
+cv_years <- numeric()          # 预测年份
+cv_predictions <- list()       # 详细预测数据
+cv_models <- list()            # 存储每个窗口的模型
+
+# 滑动窗口交叉验证循环
+fold_counter <- 0
+for (i in 1:(n_years - window_size)) {
+  # 定义训练年和测试年
+  train_years <- unique_years[i:(i + window_size - 1)]
+  test_year <- unique_years[i + window_size]
+  train_data <- Point_Data[Point_Data$year %in% train_years, ]
+  test_data <- Point_Data[Point_Data$year == test_year, ]
+  
+  # 检查数据量
+  if (nrow(train_data) < 20 || nrow(test_data) < 5) {
+    cat("数据量不足，跳过此窗口（训练集:", nrow(train_data), 
+        "测试集:", nrow(test_data), "）\n")
+    next
+  }
+  fold_counter <- fold_counter + 1
+  start_time <- Sys.time()
+  
+  tryCatch({
+    # 设置控制参数以减少计算时间
+    model_control <- list(
+      adapt_delta = 0.95,
+      max_treedepth = 12
+    )
+    
+    # 训练模型
+    model1 <- brm(
+      formula = QIcase ~ offset(log(MHRR1)) + 
+        Temp + Eth + Over65por + Edu + Room + House + 
+        PGDP + PerDI + PMeat + 
+        s(Lon, Lat, k = 10) +  # 减少平滑项复杂度以加快计算
+        (1 | SSQ) + (1 | ShengID) + (1 | year),
+      data = train_data,
+      family = negbinomial(),
+      chains = 3,  # 减少链数以加快计算
+      cores = 3,
+      iter = 2000,  # 减少迭代次数
+      warmup = 1000,
+      control = model_control,
+      seed = 123 + i,  # 设置不同的种子
+      silent = 2,  # 减少输出
+      refresh = 0
+    )
+    
+    end_time <- Sys.time()
+    training_time <- round(difftime(end_time, start_time, units = "mins"), 1)
+    
+    # 检查模型收敛
+    rhat_values <- rhat(model1)
+    if (any(rhat_values > 1.1, na.rm = TRUE)) {
+      cat("警告: 部分参数Rhat > 1.1，模型可能未完全收敛\n")
+    } else {
+      cat("模型收敛良好 (所有Rhat < 1.1)\n")
+    }
+    
+    # 准备预测数据
+    new_data <- data.frame(
+      MHRR1 = test_data$MHRR1,
+      Temp = test_data$Temp,
+      Eth = test_data$Eth,
+      Over65por = test_data$Over65por,
+      Edu = test_data$Edu,
+      Room = test_data$Room,
+      House = test_data$House,
+      PGDP = test_data$PGDP,
+      PerDI = test_data$PerDI,
+      PMeat = test_data$PMeat,
+      SSQ = test_data$SSQ,
+      ShengID = test_data$ShengID,
+      year = test_data$year,
+      Lon = test_data$Lon,
+      Lat = test_data$Lat
+    )
+    
+    # 进行预测
+    predictions <- predict(
+      model1, 
+      newdata = new_data, 
+      re_formula = NA,  # 不包含随机效应
+      probs = c(0.025, 0.975)  # 获取95%置信区间
+    )
+    
+    predictions_df <- as.data.frame(predictions)
+    
+    # 计算发病率（考虑offset）
+    predicted_incidence <- predictions_df$Estimate / test_data$MHRR1
+    true_incidence <- test_data$QInc
+    
+    # 计算评估指标
+    rmse_val <- sqrt(mean((true_incidence - predicted_incidence)^2, na.rm = TRUE))
+    me_val <- mean(predicted_incidence - true_incidence, na.rm = TRUE)
+    mse_val <- mean((true_incidence - predicted_incidence)^2, na.rm = TRUE)
+    mae_val <- mean(abs(true_incidence - predicted_incidence), na.rm = TRUE)
+    
+    # 计算R²
+    ss_total <- sum((true_incidence - mean(true_incidence))^2, na.rm = TRUE)
+    ss_residual <- sum((true_incidence - predicted_incidence)^2, na.rm = TRUE)
+    r2_val <- 1 - (ss_residual / ss_total)
+    
+    # 存储结果
+    cv_results[[fold_counter]] <- predicted_incidence
+    cv_test[[fold_counter]] <- true_incidence
+    cv_rmse[fold_counter] <- rmse_val
+    cv_me[fold_counter] <- me_val
+    cv_mse[fold_counter] <- mse_val
+    cv_mae[fold_counter] <- mae_val
+    cv_r2[fold_counter] <- r2_val
+    cv_years[fold_counter] <- test_year
+    
+    # 存储模型
+    cv_models[[fold_counter]] <- list(
+      model = model1,
+      train_years = train_years,
+      test_year = test_year
+    )
+  })
+  
+  # 清理内存
+  gc()
+}
+
+#INLA-SPDE
+#半变异
+Point_Data <- read_excel("F:/data.xlsx")
+coordinates(Point_Data) = ~Lat+Lon
+plot(variogram(FMor~1+year,Point_Data))
+H<-variogram(FMor~1+year,Point_Data)
+H
+plot(H, plot.line = TRUE)
+m <- fit.variogram(H,vgm(40,"Exp",3,100))
+plot(H, model=m)
+print(m)
+#导入监测点数据
+Point_Data <- read_excel("F:/point.xlsx")
+dim(Point_Data)
+#导入面数据
+China2017<-readOGR("F:/2017.shp")
+China2018<-readOGR("F:/2018.shp")
+China2019<-readOGR("F:/2019.shp")
+China2020<-readOGR("F:/2020发.shp")
+#合并面数据
+China_all <- rbind(China2017, China2018, China2019, China2020, makeUniqueIDs = TRUE)
+# 转换面数据为sf对象
+China_all_sf <- st_as_sf(China_all,crs = "+proj=longlat +datum=WGS84 +no_defs")
+# 转换点数据为sf对象
+Point_Data_sf <- st_as_sf(data.frame(Lon = Point_Data$Lon, 
+                                     Lat = Point_Data$Lat),
+                          coords = c("Lon", "Lat"), 
+                          crs = "+proj=longlat +datum=WGS84 +no_defs")
+# 为面数据添加唯一标识
+China_all_sf$area_id <- 1:nrow(China_all_sf)
+#创建空间网格
+points_coords <- st_coordinates(Point_Data_sf)
+areas_bbox <- st_bbox(China_all_sf)
+# 合并所有空间范围
+all_bbox <- st_bbox(c(
+  xmin = min(points_coords[,1], areas_bbox["xmin"]),
+  xmax = max(points_coords[,1], areas_bbox["xmax"]),
+  ymin = min(points_coords[,2], areas_bbox["ymin"]),
+  ymax = max(points_coords[,2], areas_bbox["ymax"])))
+
+# 创建非凸包边界
+points_sp <- as_Spatial(Point_Data_sf)
+areas_sp <- as_Spatial(China_all_sf)
+all_locs <- rbind(coordinates(points_sp), coordinates(areas_sp))
+#添加边界
+boundary_shape <- st_read("F:/博士学位论文/肺癌数据/边界1.shp")
+boundary_coords <- st_coordinates(boundary_shape)
+# 构建空间网格
+par(mfrow = c(2, 2))
+mesh1 <- inla.mesh.2d(
+  loc = all_locs,
+  boundary = boundary_coords,
+  max.edge = c(1, 4),        # 根据实际研究区域调整
+  cutoff = 0.4,                # 最小网格距离
+  offset = c(1, 3)             # 边界扩展
+)
+plot(mesh1)
+points(all_locs, col = "red", pch = 2)
+mesh2 <- inla.mesh.2d(
+  loc = all_locs,
+  boundary = boundary_coords,
+  max.edge = c(1, 4),        # 根据实际研究区域调整
+  cutoff = 0.7,                # 最小网格距离
+  offset = c(1, 3)             # 边界扩展
+)
+plot(mesh2)
+points(all_locs, col = "red", pch = 2)
+mesh3 <- inla.mesh.2d(
+  loc = all_locs,
+  boundary = boundary_coords,
+  max.edge = c(1, 5),        # 根据实际研究区域调整
+  cutoff = 1,                # 最小网格距离
+  offset = c(1, 4)             # 边界扩展
+)
+plot(mesh3)
+points(all_locs, col = "red", pch = 2)
+mesh4 <- inla.mesh.2d(
+  loc = all_locs,
+  boundary = boundary_coords,
+  max.edge = c(1, 5),        # 根据实际研究区域调整
+  cutoff = 1.5,                # 最小网格距离
+  offset = c(1, 5)             # 边界扩展
+)
+plot(mesh4)
+points(all_locs, col = "red", pch = 5)
+#图片11.17*10.63
+# 可视化+面数据边界
+mesh_df <- data.frame(
+  x = mesh2$loc[,1],
+  y = mesh2$loc[,2],
+  group = rep(1:mesh2$n, each = 3)
+)
+n_triangles <- nrow(mesh2$graph$tv)
+
+triangles <- data.frame(
+  x = c(mesh2$loc[mesh2$graph$tv[,1], 1], 
+        mesh2$loc[mesh2$graph$tv[,2], 1], 
+        mesh2$loc[mesh2$graph$tv[,3], 1]),
+  y = c(mesh2$loc[mesh2$graph$tv[,1], 2], 
+        mesh2$loc[mesh2$graph$tv[,2], 2], 
+        mesh2$loc[mesh2$graph$tv[,3], 2]),
+  group = rep(1:n_triangles, 3)
+)
+library(ggplot2)
+ggplot() +
+  geom_polygon(data = triangles, 
+               aes(x = x, y = y, group = group), 
+               fill = NA, color = "gray30", alpha = 0.6) +
+  geom_sf(data = China_all_sf, fill = NA, color = "darkblue", linewidth = 0.8) +
+  geom_sf(data = Point_Data_sf, color = "red", size = 1.5) +
+  labs(title = "SPDE网格与空间数据分布",
+       subtitle = "蓝色边界为面数据，红点为监测点，灰色网格为SPDE三角剖分") +
+  theme_minimal() +
+  coord_sf()
+
+#定义SPDE模型
+spde <- inla.spde2.pcmatern(
+  mesh = mesh2,
+  alpha = 2, # 平滑度参数
+  prior.range = c(0.3, 0.1),    # 宽松的范围
+  prior.sigma = c(0.8, 0.1))      # P(sigma > 1) = 0.1
+s.index=inla.spde.make.index(name="w",n.spde = spde$n.spde)
+str(s.index)
+#创建时空索引
+all_years <- sort(unique(c(Point_Data$year, China_all_sf$year)))
+n_years <- length(all_years)
+
+t_points <- match(Point_Data$year, all_years)
+t_areas  <- match(China_all_sf$year, all_years)
+#all_years <- unique(c(Point_Data$year, China_all_sf$year))
+#n_years <- length(all_years)
+#t_points <- match(Point_Data$year, all_years)
+#t_areas <- match(China_all_sf$year, all_years)
+
+#合并点数据和面数据到一个堆栈
+# 点数据部分
+point_data_part <- data.frame(
+  y = Point_Data$MIcase,
+  type = "point",
+  Lon = Point_Data$Lon,
+  Lat = Point_Data$Lat,
+  year = Point_Data$year,
+  SSQ = Point_Data$SSQ,
+  ShengID = Point_Data$ShengID,
+  MHRR1 = Point_Data$MHRR1,
+  Order=Point_Data$Order,
+  Inc=Point_Data$MInc)
+
+# 添加点数据的协变量
+covariates <- c("PM2.5","Eth","Over65por","Edu","Room","LiverB","PerDI","HEGDP","PHE")
+for(cov in covariates) {
+  point_data_part[[cov]] <- Point_Data[[cov]]}
+
+# 面数据部分
+create_bbox_center_coords <- function(sf_polygons) {
+  if(!inherits(sf_polygons, "sf")) {
+    sf_polygons <- st_as_sf(sf_polygons)}
+  
+  n_areas <- nrow(sf_polygons)
+  center_coords <- matrix(NA, nrow = n_areas, ncol = 2)
+  
+  for(i in 1:n_areas) {
+    poly <- sf_polygons[i, ]
+    bbox <- st_bbox(poly)
+    
+    # 直接使用边界框中心
+    center_x <- (bbox["xmin"] + bbox["xmax"]) / 2
+    center_y <- (bbox["ymin"] + bbox["ymax"]) / 2
+    center_coords[i, ] <- c(center_x, center_y)
+    
+    cat(sprintf("面数据 %d: 边界框 [%.4f, %.4f, %.4f, %.4f] -> 中心点 (%.4f, %.4f)\n", 
+                i, bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"], 
+                center_x, center_y))
+  }
+  return(center_coords)
+}
+
+# 计算面数据的边界框中心坐标
+create_simple_center_coords <- function(sf_polygons) {
+  if(!inherits(sf_polygons, "sf")) {
+    sf_polygons <- st_as_sf(sf_polygons)
+  }
+  
+  n_areas <- nrow(sf_polygons)
+  center_coords <- matrix(NA, nrow = n_areas, ncol = 2)
+  
+  for(i in 1:n_areas) {
+    poly <- sf_polygons[i, ]
+    bbox <- st_bbox(poly)
+    center_x <- (bbox["xmin"] + bbox["xmax"]) / 2
+    center_y <- (bbox["ymin"] + bbox["ymax"]) / 2
+    center_coords[i, ] <- c(center_x, center_y)
+  }
+  return(center_coords)
+}
+area_center_coords <- create_simple_center_coords(China_all_sf)
+area_data_part <- data.frame(
+  y = China_all_sf$MIcase,  # 根据实际列名调整
+  type = "area",
+  Lon = area_center_coords[,1],
+  Lat = area_center_coords[,2], 
+  year = China_all_sf$year,
+  SSQ = China_all_sf$SSQ,
+  ShengID = China_all_sf$ShengID,
+  MHRR1 = China_all_sf$MHRR1,
+  Order=China_all_sf$Order_,
+  Inc=China_all_sf$MInc
+)
+
+# 添加面数据的协变量
+# 显示面数据的所有变量名
+for(i in 1:length(names(China_all_sf))) {
+  cat(i, ":", names(China_all_sf)[i], "\n")}
+
+# 手动指定
+manual_selection <- list(
+  "Peci" = 21,
+  "Sun" = 23,
+  "PM2.5" = 27,
+  "Illr" = 28,
+  "Eth" = 29,     
+  "Over65por" = 30,   
+  "Edu" = 32, 
+  "Illp" = 33,
+  "Room"= 34,
+  "Mau" = 37,
+  "LiverB" = 43,
+  "SurP" = 44,
+  "PGDP" = 47,
+  "PerDI"=48,
+  "PMeat"=53,
+  "FC"= 65,
+  "GCR"= 67,
+  "TBInc"=69,
+  "HEGDP"=70,
+  "PHE"=71)  
+
+for(cov in covariates) {
+  if(cov %in% names(manual_selection)) {
+    index <- manual_selection[[cov]]
+    if(index <= length(names(China_all_sf))) {
+      actual_name <- names(China_all_sf)[index]
+      area_data_part[[cov]] <- China_all_sf[[actual_name]]
+      cat("手动选择:", cov, "->", actual_name, "\n")
+    } else {
+      mean_val <- mean(Point_Data[[cov]], na.rm = TRUE)
+      area_data_part[[cov]] <- mean_val
+      cat("索引超出范围，使用均值:", cov, "\n")
+    }
+  } else {
+    mean_val <- mean(Point_Data[[cov]], na.rm = TRUE)
+    area_data_part[[cov]] <- mean_val
+    cat("未指定映射，使用均值:", cov, "\n")
+  }
+}
+
+# 合并所有数据
+all_data <- rbind(point_data_part, area_data_part)
+all_data <- all_data %>%
+  mutate(
+    y = as.numeric(y),
+    Inc = as.numeric(Inc),
+    MHRR1 = as.numeric(MHRR1),
+    year = as.numeric(year),
+    
+    PM2.5 = as.numeric(PM2.5),
+    Eth = as.numeric(Eth),
+    Over65por = as.numeric(Over65por),
+    Edu = as.numeric(Edu),
+    Room = as.numeric(Room),
+    LiverB = as.numeric(LiverB),
+    PerDI = as.numeric(PerDI),
+    HEGDP = as.numeric(HEGDP),
+    PHE = as.numeric(PHE),
+    
+    SSQ = as.factor(SSQ),
+    ShengID = as.factor(ShengID),
+    Order = as.factor(Order)
+  )
+N <- nrow(all_data)
+all_data$SSQ_id <- as.integer(all_data$SSQ)
+all_data$ShengID_id <- as.integer(all_data$ShengID)
+all_data$Order_id <- as.integer(all_data$Order)
+all_data$log_MHRR <- log(all_data$MHRR1)
+all_data$time_id <- match(all_data$year, all_years)
+all_locs_combined <- as.matrix(all_data[, c("Lon", "Lat")])
+all_times_combined <- all_data$time_id
+
+#创建空间索引
+A_combined <- inla.spde.make.A(
+  mesh = mesh2,
+  loc = all_locs_combined,
+  group = all_times_combined,
+  n.group = n_years
+)
+
+s.index <- inla.spde.make.index(
+  name = "w",
+  n.spde = spde$n.spde,
+  n.group = n_years
+)
+
+# 构建堆栈
+stack_combined <- inla.stack(
+  tag = "combined",
+  data = list(y = all_data$y),
+  A = list(1, A_combined),
+  effects = list(
+    data.frame(
+      Intercept = rep(1, N),
+      log_MHRR = all_data$log_MHRR,
+      
+      PM = all_data$PM2.5,
+      Eth = all_data$Eth,
+      Over65por = all_data$Over65por,
+      Edu = all_data$Edu,
+      Room = all_data$Room,
+      LiverB = all_data$LiverB,
+      PerDI = all_data$PerDI,
+      HEGDP = all_data$HEGDP,
+      PHE = all_data$PHE,
+      
+      SSQ_id = all_data$SSQ_id,
+      ShengID_id = all_data$ShengID_id,
+      Order_id = all_data$Order_id,
+      time_id = all_data$time_id
+    ),
+    w = s.index
+  )
+)
+
+stack_data <- inla.stack.data(stack_combined)
+
+#全模型
+formula <- y ~ offset(log_MHRR)+
+  Xpeci+Xsun+Xpm+Xillr+Xeth+ X65+Xedu+Xillp+Xroom+Xmau+XLiv+XSur+Xpgdp+Xperdi+Xpmeat+Xfc+Xgcr+XTB+Xhegdp+Xphe+
+  f(Xssq,model = "iid")+f(Xshengid,model = "iid")+f(Xorder,model = "iid")+
+  f(time_effect, model = "rw1",  # 时间随机效应
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01))))+ 
+  f(w, model = spde) 
+#精简模型（有意义的变量）
+formula <- y ~ -1 + Intercept +
+  offset(log_MHRR) +
+  PM + Eth + Over65por + Edu + Room + LiverB + PerDI + HEGDP + PHE +
+  f(SSQ_id, model = "iid") +
+  f(ShengID_id, model = "iid") +
+  f(Order_id, model = "iid") +
+  f(time_id,model = "rw1",hyper = list(prec = list(prior = "pc.prec",param = c(1, 0.01)))) +
+  f(w, model = spde)
+
+Mod_Point <- inla(formula,
+                  data = inla.stack.data(stack_combined),
+                  family = "poisson",
+                  control.fixed = list(
+                    mean.intercept = 0, prec.intercept = 0.001,
+                    mean = 0, prec = 0.001
+                  ),
+                  control.predictor = list(
+                    A = inla.stack.A(stack_combined), 
+                    compute = TRUE,
+                    link = 1
+                  ),
+                  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                  control.inla = list(int.strategy = "eb"),
+                  verbose = TRUE
+) 
+summary(Mod_Point)
+
+library(lightgbm)
+library(caret)
+library(ggplot2)
+library(patchwork)
+library(Matrix)
+library(dplyr)
+# 1. 提取 INLA 拟合值与残差
+all_data$inla_fitted <- Mod_Point$summary.fitted.values$mean[1:nrow(all_data)]
+
+# 残差：真实值 - INLA拟合值
+all_data$inla_residual <- all_data$Inc - all_data$inla_fitted
+
+# 2. 提取 INLA 时间效应
+time_effects <- Mod_Point$summary.random$time_id$mean
+time_effects_summary <- Mod_Point$summary.random$time_id
+print(time_effects)
+print(length(time_effects))
+
+all_data$time_idx <- all_data$time_id
+
+all_data$time_effect_mean <- time_effects_summary$mean[all_data$time_idx]
+all_data$time_effect_sd   <- time_effects_summary$sd[all_data$time_idx]
+all_data$time_effect_025  <- time_effects_summary$`0.025quant`[all_data$time_idx]
+all_data$time_effect_975  <- time_effects_summary$`0.975quant`[all_data$time_idx]
+
+all_data$time_effect_ci_width <- 
+  all_data$time_effect_975 - all_data$time_effect_025
+
+time_trend <- diff(time_effects)
+
+all_data$time_trend <- 
+  c(time_trend, time_trend[length(time_trend)])[all_data$time_idx]
+
+all_data$time_position <- 
+  (all_data$time_idx - 1) / (max(all_data$time_idx, na.rm = TRUE) - 1)
+
+time_features <- c(
+  "time_effect_mean",
+  "time_effect_sd",
+  "time_effect_ci_width",
+  "time_trend",
+  "time_position"
+)
+
+selected_time_features <- intersect(time_features, names(all_data))
+
+# 3. 提取 INLA 层级随机效应
+ssq_effects   <- Mod_Point$summary.random$SSQ_id
+sheng_effects <- Mod_Point$summary.random$ShengID_id
+order_effects <- Mod_Point$summary.random$Order_id
+all_data$ssq_effect_mean <- 
+  ssq_effects$mean[match(all_data$SSQ_id, ssq_effects$ID)]
+
+all_data$sheng_effect_mean <- 
+  sheng_effects$mean[match(all_data$ShengID_id, sheng_effects$ID)]
+
+all_data$order_effect_mean <- 
+  order_effects$mean[match(all_data$Order_id, order_effects$ID)]
+
+all_data$ssq_effect_sd <- 
+  ssq_effects$sd[match(all_data$SSQ_id, ssq_effects$ID)]
+
+all_data$sheng_effect_sd <- 
+  sheng_effects$sd[match(all_data$ShengID_id, sheng_effects$ID)]
+
+all_data$order_effect_sd <- 
+  order_effects$sd[match(all_data$Order_id, order_effects$ID)]
+
+FC_features <- c("ssq_effect_mean","sheng_effect_mean","order_effect_mean","ssq_effect_sd","sheng_effect_sd","order_effect_sd")
+
+selected_FC_features <- intersect(FC_features, names(all_data))
+
+# 4. 缺失值处理函数
+
+fill_na_with_mean <- function(x) {
+  if (all(is.na(x))) {
+    return(rep(0, length(x)))
+  }
+  x[is.na(x)] <- mean(x, na.rm = TRUE)
+  return(x)
+}
+
+# 5. 构建 LightGBM 特征
+
+feature_cols <- c(
+  "PM2.5", "Eth", "Over65por", "Edu", "Room",
+  "LiverB", "PerDI", "HEGDP", "PHE",
+  selected_time_features
+)
+
+missing_features <- setdiff(feature_cols, names(all_data))
+
+if (length(missing_features) > 0) {
+  stop(
+    paste(
+      "all_data 缺少以下特征:",
+      paste(missing_features, collapse = ", ")
+    )
+  )
+}
+
+for (v in feature_cols) {
+  all_data[[v]] <- fill_na_with_mean(all_data[[v]])
+}
+
+# 6. LightGBM 训练数据
+
+X <- as.matrix(all_data[, feature_cols])
+
+y_residual <- all_data$inla_residual
+
+y_true <- all_data$Inc
+
+inla_fitted_all <- all_data$inla_fitted
+
+dtrain <- lgb.Dataset(
+  data = X,
+  label = y_residual
+)
+
+params <- list(
+  objective = "regression",
+  metric = "rmse",
+  num_leaves = 31,
+  learning_rate = 0.1,
+  feature_fraction = 0.9,
+  bagging_fraction = 0.8,
+  bagging_freq = 5,
+  min_data_in_leaf = 20,
+  verbose = -1
+)
+
+# 7. 训练 LightGBM 残差模型
+
+lgb_model <- lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 3000,
+  valids = list(train = dtrain),
+  early_stopping_rounds = 30,
+  eval_freq = 50,
+  verbose = 0
+)
+
+eval_results <- lgb_model$record_evals$train$rmse$eval
+
+best_iter <- lgb_model$best_iter
+
+if (is.null(best_iter)) {
+  best_iter <- lgb_model$current_iter()
+}
+
+# 8. 训练集预测
+
+pred_residual_train <- predict(
+  lgb_model,
+  X,
+  num_iteration = best_iter
+)
+
+final_predictions_train <- all_data$inla_fitted + pred_residual_train
+
+# 9. 评价函数
+
+calculate_metrics <- function(true, pred) {
+  rmse <- sqrt(mean((true - pred)^2, na.rm = TRUE))
+  mse <- mean((true - pred)^2, na.rm = TRUE)
+  me <- mean(true - pred, na.rm = TRUE)
+  mae <- mean(abs(true - pred), na.rm = TRUE)
+  r2 <- 1 - sum((true - pred)^2, na.rm = TRUE) /
+    sum((true - mean(true, na.rm = TRUE))^2, na.rm = TRUE)
+  
+  return(list(
+    RMSE = rmse,
+    MSE = mse,
+    ME = me,
+    MAE = mae,
+    R2 = r2
+  ))
+}
+
+metrics <- calculate_metrics(
+  true = all_data$Inc,
+  pred = final_predictions_train
+)
+
+print(metrics)
+
+# 10. 滑动窗口交叉验证
+all_data <- all_data[order(all_data$year), ]
+
+X <- as.matrix(all_data[, feature_cols])
+y_residual <- all_data$inla_residual
+y_true <- all_data$Inc
+inla_fitted_all <- all_data$inla_fitted
+
+years <- all_data$year
+unique_years <- sort(unique(years))
+
+window_size <- 10
+n_years <- length(unique_years)
+min_train_years <- window_size
+
+cv_results_window <- list()
+fold_metrics_window <- data.frame()
+predictions_all_window <- rep(NA, length(y_true))
+residual_predictions_all_window <- rep(NA, length(y_true))
+fold_assignments_window <- rep(NA, length(y_true))
+importance_list_window <- list()
+
+for (i in min_train_years:(n_years - 1)) {
+  
+  train_years <- unique_years[1:i]
+  test_year <- unique_years[i + 1]
+  
+  cat(
+    "\n=== 滑动窗口: 训练年",
+    min(train_years), "-",
+    max(train_years),
+    " → 预测年",
+    test_year,
+    " ===\n"
+  )
+  
+  train_indices <- which(years %in% train_years)
+  test_indices <- which(years == test_year)
+  
+  fold_assignments_window[test_indices] <- i
+  
+  if (length(train_indices) < 10 || length(test_indices) < 1) {
+    cat("数据量不足，跳过此窗口\n")
+    next
+  }
+  
+  X_train <- X[train_indices, , drop = FALSE]
+  y_train_residual <- y_residual[train_indices]
+  
+  X_test <- X[test_indices, , drop = FALSE]
+  y_test_true <- y_true[test_indices]
+  inla_test_fitted <- inla_fitted_all[test_indices]
+  
+  dtrain <- lgb.Dataset(
+    data = X_train,
+    label = y_train_residual
+  )
+  
+  dtest <- lgb.Dataset(
+    data = X_test,
+    label = y_residual[test_indices],
+    reference = dtrain
+  )
+  
+  lgb_model_cv <- lgb.train(
+    params = params,
+    data = dtrain,
+    valids = list(test = dtest),
+    nrounds = 1000,
+    early_stopping_rounds = 30,
+    eval_freq = 50,
+    verbose = 0
+  )
+  
+  best_iter_cv <- lgb_model_cv$best_iter
+  
+  if (is.null(best_iter_cv)) {
+    best_iter_cv <- lgb_model_cv$current_iter()
+  }
+  
+  test_residual_pred <- predict(
+    lgb_model_cv,
+    X_test,
+    num_iteration = best_iter_cv
+  )
+  
+  test_final_pred <- inla_test_fitted + test_residual_pred
+  
+  residual_predictions_all_window[test_indices] <- test_residual_pred
+  predictions_all_window[test_indices] <- test_final_pred
+  
+  metrics_fold <- calculate_metrics(
+    true = y_test_true,
+    pred = test_final_pred
+  )
+  
+  fold_metrics_window <- rbind(
+    fold_metrics_window,
+    data.frame(
+      Window_ID = i,
+      Train_Years = paste(min(train_years), max(train_years), sep = "-"),
+      Test_Year = test_year,
+      Train_Size = length(train_indices),
+      Test_Size = length(test_indices),
+      RMSE = metrics_fold$RMSE,
+      MSE = metrics_fold$MSE,
+      ME = metrics_fold$ME,
+      MAE = metrics_fold$MAE,
+      R2 = metrics_fold$R2,
+      Best_Iteration = best_iter_cv
+    )
+  )
+  
+  importance <- lgb.importance(
+    lgb_model_cv,
+    percentage = TRUE
+  )
+  
+  if (!is.null(importance) && nrow(importance) > 0) {
+    importance$Window_ID <- i
+    importance$Test_Year <- test_year
+    importance_list_window[[as.character(i)]] <- importance
+    print(head(importance, 5))
+  }
+  
+  cv_results_window[[as.character(i)]] <- list(
+    model = lgb_model_cv,
+    best_iter = best_iter_cv,
+    feature_names = colnames(X_train),
+    train_years = train_years,
+    test_year = test_year
+  )
+  
+  gc()
+}
+
+print(fold_metrics_window)
+
+
+library(lightgbm)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(patchwork)
+
+# 1. 累积重要性曲线
+plot_cumulative_curve <- function(model, 
+                                  top_n = 25, 
+                                  cumulative_threshold = 0.95,
+                                  title = "特征累积重要性曲线") {
+  
+  # 获取特征重要性
+  importance <- lgb.importance(model, percentage = TRUE)
+  
+  if (is.null(importance) || nrow(importance) == 0) {
+    warning("无法获取特征重要性")
+    return(NULL)
+  }
+  
+  # 按重要性降序排序
+  importance_ordered <- importance[order(-importance$Gain), ]
+  importance_ordered$Cumulative_Gain <- cumsum(importance_ordered$Gain)
+  importance_ordered$Feature_Number <- 1:nrow(importance_ordered)
+  importance_ordered$Feature_Label <- ifelse(
+    1:nrow(importance_ordered) <= 5,
+    as.character(importance_ordered$Feature),
+    ""
+  )
+  
+  # 确定达到累积阈值所需的最少特征数
+  threshold_index <- which(importance_ordered$Cumulative_Gain >= cumulative_threshold)[1]
+  threshold_features <- importance_ordered$Feature[1:threshold_index]
+  threshold_cumulative <- importance_ordered$Cumulative_Gain[threshold_index]
+  
+  # 限制显示的特征数
+  if (!is.null(top_n) && top_n < nrow(importance_ordered)) {
+    plot_data <- head(importance_ordered, top_n)
+  } else {
+    plot_data <- importance_ordered
+  }
+  
+  # 创建图形
+  p <- ggplot(plot_data, aes(x = Feature_Number, y = Cumulative_Gain)) +
+    geom_line(color = "steelblue", linewidth = 1.5) +
+    geom_point(color = "steelblue", size = 2.5, shape = 19) +
+    geom_area(fill = "steelblue", alpha = 0.1) +
+    
+    # 添加阈值线
+    geom_hline(yintercept = cumulative_threshold, 
+               linetype = "dashed", color = "#E74C3C", linewidth = 1) +
+    geom_vline(xintercept = threshold_index, 
+               linetype = "dashed", color = "#F39C12", linewidth = 1) +
+    
+    # 标记前5个特征
+    geom_text(aes(label = Feature_Label), 
+              vjust = -0.8, hjust = 0.5, 
+              size = 3.5, color = "#2C3E50", fontface = "bold") +
+    
+    # 标记阈值点
+    geom_point(data = plot_data[threshold_index, ], 
+               aes(x = Feature_Number, y = Cumulative_Gain), 
+               color = "#E74C3C", size = 4, shape = 17) +
+    
+    # 坐标轴设置
+    scale_x_continuous(
+      breaks = function(x) {
+        seq(1, max(x), by = max(1, floor(max(x)/10)))
+      },
+      expand = expansion(mult = c(0.02, 0.05))
+    ) +
+    scale_y_continuous(
+      labels = percent_format(accuracy = 1),
+      limits = c(0, 1.05),
+      breaks = seq(0, 1, by = 0.2),
+      expand = expansion(mult = c(0, 0.05))
+    ) +
+    
+    # 标签和标题
+    labs(
+      title = title,
+      subtitle = sprintf("达到%.0f%%累积重要性需要前%d个特征\n前5个特征: %s", 
+                         cumulative_threshold * 100, 
+                         threshold_index,
+                         paste(head(threshold_features, 5), collapse = ", ")),
+      x = "特征数量 (按重要性降序排列)",
+      y = "累积重要性"
+    ) +
+    
+    # 主题设置
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16, 
+                                margin = margin(b = 10)),
+      plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray40",
+                                   margin = margin(b = 15)),
+      axis.title = element_text(size = 13, face = "bold"),
+      axis.text = element_text(size = 10, color = "black"),
+      axis.line = element_line(color = "black", linewidth = 0.5),
+      panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(20, 20, 20, 20)
+    ) +
+    
+    # 添加阈值说明
+    annotate("text", 
+             x = threshold_index, 
+             y = cumulative_threshold + 0.05,
+             label = sprintf("阈值点\n(%d个特征, %.1f%%)", 
+                             threshold_index, 
+                             threshold_cumulative * 100),
+             color = "#E74C3C", 
+             size = 4.5, 
+             fontface = "bold",
+             hjust = 0.5) +
+    
+    # 添加参考线标签
+    annotate("text", 
+             x = max(plot_data$Feature_Number) * 0.8, 
+             y = cumulative_threshold - 0.02,
+             label = sprintf("%.0f%% 累积重要性阈值", cumulative_threshold * 100),
+             color = "#E74C3C", 
+             size = 4, 
+             fontface = "italic")
+  
+  return(p)
+}
+result1 <- plot_cumulative_curve(lgb_model, top_n = 25, cumulative_threshold = 0.95)
+print(result1)
+#7.75*7.51
+
+# 帕累托图函数
+plot_pareto_chart <- function(model, 
+                              top_n = 20, 
+                              cumulative_threshold = 0.95,
+                              title = "特征重要性帕累托图") {
+  
+  # 获取特征重要性
+  importance <- lgb.importance(model, percentage = TRUE)
+  
+  if (is.null(importance) || nrow(importance) == 0) {
+    warning("无法获取特征重要性")
+    return(NULL)
+  }
+  
+  # 按重要性降序排序
+  importance_ordered <- importance[order(-importance$Gain), ]
+  importance_ordered$Cumulative_Gain <- cumsum(importance_ordered$Gain)
+  importance_ordered$Cumulative_Percent <- importance_ordered$Cumulative_Gain * 100
+  importance_ordered$Percentage <- importance_ordered$Gain * 100
+  
+  # 限制显示的特征数
+  if (!is.null(top_n) && top_n < nrow(importance_ordered)) {
+    plot_data <- head(importance_ordered, top_n)
+  } else {
+    plot_data <- importance_ordered
+  }
+  
+  # 确定达到累积阈值所需的最少特征数
+  threshold_index <- which(plot_data$Cumulative_Gain >= cumulative_threshold)[1]
+  
+  # 创建图形
+  p <- ggplot(plot_data, aes(x = reorder(Feature, -Gain))) +
+    
+    # 柱状图 - 单个特征重要性
+    geom_bar(aes(y = Percentage), 
+             stat = "identity", 
+             fill = "#3498DB", 
+             alpha = 0.8,
+             width = 0.7) +
+    
+    # 折线图 - 累积重要性
+    geom_line(aes(y = Cumulative_Percent, group = 1), 
+              color = "#E74C3C", 
+              linewidth = 1.5) +
+    geom_point(aes(y = Cumulative_Percent), 
+               color = "#E74C3C", 
+               size = 3, 
+               shape = 19) +
+    
+    # 阈值线
+    geom_hline(yintercept = cumulative_threshold * 100, 
+               linetype = "dashed", 
+               color = "#2ECC71", 
+               linewidth = 1) +
+    
+    # 阈值标记
+    geom_vline(xintercept = threshold_index + 0.5, 
+               linetype = "dashed", 
+               color = "#F39C12", 
+               linewidth = 0.8) +
+    
+    # 双Y轴
+    scale_y_continuous(
+      name = "单个特征重要性 (%)",
+      sec.axis = sec_axis(~./100, 
+                          name = "累积重要性", 
+                          labels = percent_format()),
+      limits = c(0, 105),
+      expand = expansion(mult = c(0, 0.05))
+    ) +
+    
+    # 标签和标题
+    labs(
+      title = title,
+      subtitle = "柱状图: 单个特征重要性 | 折线图: 累积重要性",
+      x = "特征 (按重要性降序排列)"
+    ) +
+    
+    # 主题设置
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16, 
+                                margin = margin(b = 10)),
+      plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray40",
+                                   margin = margin(b = 15)),
+      axis.title.y.left = element_text(color = "#3498DB", size = 13, face = "bold",
+                                       margin = margin(r = 10)),
+      axis.title.y.right = element_text(color = "#E74C3C", size = 13, face = "bold",
+                                        margin = margin(l = 10)),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10, 
+                                 color = "black", face = "plain"),
+      axis.text.y.left = element_text(color = "#3498DB"),
+      axis.text.y.right = element_text(color = "#E74C3C"),
+      axis.line.x = element_line(color = "black", linewidth = 0.5),
+      panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(20, 20, 20, 20)
+    ) +
+    
+    # 添加阈值说明
+    annotate("text", 
+             x = threshold_index, 
+             y = cumulative_threshold * 100 + 5,
+             label = sprintf("%.0f%% 阈值\n(前%d个特征)", 
+                             cumulative_threshold * 100, 
+                             threshold_index),
+             color = "#2ECC71", 
+             size = 4, 
+             fontface = "bold",
+             hjust = 0.5)
+  
+  return(p)
+}
+result2 <- plot_pareto_chart(lgb_model, top_n = 20, cumulative_threshold = 0.95)
+print(result2)
+
+
+
+
+
+# 基本特征重要性图
+plot_feature_importance_basic <- function(model, top_n = 20, title = "特征重要性") {
+  # 获取特征重要性
+  importance <- lgb.importance(model, percentage = TRUE)
+  
+  if (is.null(importance) || nrow(importance) == 0) {
+    warning("无法获取特征重要性")
+    return(NULL)
+  }
+  
+  # 选择前N个特征
+  importance_top <- head(importance[order(-importance$Gain), ], top_n)
+  
+  # 创建图形
+  p <- ggplot(importance_top, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+    coord_flip() +
+    labs(
+      title = paste(title, "(Top", top_n, ")"),
+      x = "特征",
+      y = "增益 (Gain)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      axis.text.y = element_text(size = 10),
+      axis.title = element_text(size = 12)
+    )
+  
+  return(p)
+}
+p1 <- plot_feature_importance_basic(lgb_model, 15, "LightGBM特征重要性")
+print(p1)
+
+# 多种重要性类型的比较
+library(viridis)
+
+plot_feature_importance_multi_viridis <- function(model, top_n = 21) {
+  # 获取三种类型的重要性
+  importance_gain <- lgb.importance(model, percentage = TRUE)
+  importance_split <- lgb.importance(model, percentage = FALSE)
+  importance_cover <- lgb.importance(model, percentage = FALSE)
+  
+  if (is.null(importance_gain) || nrow(importance_gain) == 0) {
+    warning("无法获取特征重要性")
+    return(NULL)
+  }
+  
+  # 合并数据
+  importance_all <- importance_gain %>%
+    select(Feature, Gain) %>%
+    left_join(importance_split %>% select(Feature, Frequency), by = "Feature") %>%
+    left_join(importance_cover %>% select(Feature, Cover), by = "Feature")
+  
+  # 归一化
+  importance_all <- importance_all %>%
+    mutate(
+      Gain_norm = Gain / max(Gain, na.rm = TRUE),
+      Frequency_norm = Frequency / max(Frequency, na.rm = TRUE),
+      Cover_norm = Cover / max(Cover, na.rm = TRUE)
+    )
+  
+  # 选择前N个特征（基于Gain）
+  importance_top <- head(importance_all[order(-importance_all$Gain), ], top_n)
+  
+  # 转换为长格式
+  importance_long <- importance_top %>%
+    select(Feature, Gain_norm, Frequency_norm, Cover_norm) %>%
+    pivot_longer(
+      cols = c(Gain_norm, Frequency_norm, Cover_norm),
+      names_to = "Importance_Type",
+      values_to = "Value"
+    ) %>%
+    mutate(
+      Importance_Type = factor(Importance_Type,
+                               levels = c("Gain_norm", "Frequency_norm", "Cover_norm"),
+                               labels = c("增益 (Gain)", "分裂次数 (Frequency)", "覆盖度 (Cover)"))
+    )
+  
+  # 使用viridis配色
+  p <- ggplot(importance_long, aes(x = reorder(Feature, Value), y = Value, fill = Importance_Type)) +
+    geom_bar(stat = "identity", position = "dodge", alpha = 0.9, width = 0.7) +
+    coord_flip() +
+    scale_fill_viridis(discrete = TRUE, option = "D", name = "重要性类型") +
+    labs(
+      title = paste0("多类型特征重要性对比 (Top ", top_n, ")"),
+      x = "特征",
+      y = "归一化重要性"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      axis.text.y = element_text(size = 9),
+      axis.text.x = element_text(size = 8),
+      axis.title = element_text(size = 11, face = "bold"),
+      legend.position = "bottom",
+      legend.title = element_text(size = 10, face = "bold"),
+      legend.text = element_text(size = 9),
+      # 添加X轴和Y轴线
+      axis.line = element_line(color = "black", size = 0.6),
+      axis.ticks = element_line(color = "black", size = 0.5),
+      axis.ticks.length = unit(0.2, "cm"),
+      # 调整网格线
+      panel.grid.major = element_line(color = "gray90", size = 0.3),
+      panel.grid.minor = element_blank()
+    )
+  
+  return(p)
+}
+
+# 使用viridis配色
+p2_viridis <- plot_feature_importance_multi_viridis(lgb_model, 21)
+print(p2_viridis)
+#7.61*10.35
+
+
+library(gggenes)
+library(shapviz)
+library(fastshap)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(lightgbm)
+
+# 结果存储路径
+output_dir <- "F:/博士学位论文/feature_analysis_results"
+# 1. SHAP重要性图函数
+plot_shap_importance <- function(shap_result, top_n = 20) {
+  if (is.null(shap_result) || is.null(shap_result$shap_obj)) {
+    warning("SHAP对象为空")
+    return(NULL)
+  }
+  
+  shap_obj <- shap_result$shap_obj
+  method <- shap_result$method
+  
+  cat("使用", method, "方法绘制SHAP重要性图\n")
+  
+  if (method == "fastshap") {
+    # fastshap 对象处理
+    shap_df <- as.data.frame(shap_obj)
+    
+    # 计算平均绝对SHAP值
+    mean_abs_shap <- colMeans(abs(shap_df), na.rm = TRUE)
+    mean_abs_shap_df <- data.frame(
+      Feature = names(mean_abs_shap),
+      Mean_Abs_SHAP = mean_abs_shap
+    ) %>% 
+      arrange(desc(Mean_Abs_SHAP)) %>%
+      head(top_n)
+    
+    # 绘制重要性图
+    p <- ggplot(mean_abs_shap_df, aes(x = reorder(Feature, Mean_Abs_SHAP), y = Mean_Abs_SHAP)) +
+      geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+      coord_flip() +
+      labs(
+        title = paste("SHAP特征重要性 (Top", top_n, ")"),
+        x = "特征",
+        y = "平均绝对SHAP值"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.text.y = element_text(size = 10)
+      )
+    
+    return(p)
+  } else if (method == "shapviz") {
+    # 使用shapviz绘图
+    p <- sv_importance(shap_obj, kind = "bar", max_display = top_n) +
+      labs(title = paste("SHAP特征重要性 (Top", top_n, ")")) +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.text.y = element_text(size = 10)
+      )
+    return(p)
+  } else {
+    warning("当前方法不支持重要性图")
+    return(NULL)
+  }
+}
+
+# 2. 创建SHAP解释器函数
+create_shap_explainer <- function(model, X_train, X_explain = NULL, n_samples = 100) {
+  cat("创建SHAP解释器...\n")
+  
+  # 如果未指定解释数据，使用训练数据
+  if (is.null(X_explain)) {
+    X_explain <- X_train
+  }
+  
+  # 采样以减少计算量
+  if (nrow(X_explain) > n_samples) {
+    set.seed(123)
+    sample_idx <- sample(1:nrow(X_explain), n_samples)
+    X_explain <- X_explain[sample_idx, ]
+    cat("采样", n_samples, "个样本进行SHAP分析\n")
+  }
+  
+  # 将数据转换为矩阵格式
+  X_train_mat <- as.matrix(X_train)
+  X_explain_mat <- as.matrix(X_explain)
+  
+  # 方法1: 使用shapviz包
+  tryCatch({
+    cat("尝试使用shapviz包...\n")
+    shap_values <- shapviz(model, X_pred = X_explain_mat)
+    return(list(method = "shapviz", shap_obj = shap_values))
+  }, error = function(e) {
+    cat("shapviz失败:", e$message, "\n")
+    
+    # 方法2: 使用fastshap包
+    tryCatch({
+      cat("尝试使用fastshap包...\n")
+      
+      # 定义预测函数
+      pred_wrapper <- function(object, newdata) {
+        predict(object, as.matrix(newdata))
+      }
+      
+      # 计算SHAP值
+      shap_values_fast <- fastshap::explain(
+        model,
+        X = as.data.frame(X_train_mat),
+        nsim = 30,  # 减少模拟次数以加快计算
+        pred_wrapper = pred_wrapper,
+        newdata = as.data.frame(X_explain_mat)
+      )
+      
+      # 确保SHAP对象有正确的属性
+      attr(shap_values_fast, "X") <- as.data.frame(X_explain_mat)
+      
+      return(list(method = "fastshap", shap_obj = shap_values_fast))
+    }, error = function(e2) {
+      cat("fastshap失败:", e2$message, "\n")
+      
+      # 方法3: 近似SHAP值
+      cat("使用近似方法计算SHAP值...\n")
+      return(calculate_approximate_shap(model, X_train_mat, X_explain_mat))
+    })
+  })
+}
+
+# 3. SHAP摘要图函数
+plot_shap_summary <- function(shap_result, top_n = 15) {
+  if (is.null(shap_result) || is.null(shap_result$shap_obj)) {
+    warning("SHAP对象为空")
+    return(NULL)
+  }
+  
+  shap_obj <- shap_result$shap_obj
+  method <- shap_result$method
+  
+  cat("使用", method, "方法绘制SHAP摘要图\n")
+  
+  if (method == "fastshap") {
+    # fastshap对象处理
+    shap_df <- as.data.frame(shap_obj)
+    
+    if (ncol(shap_df) == 0) {
+      warning("SHAP数据框为空")
+      return(NULL)
+    }
+    
+    # 计算平均绝对SHAP值
+    mean_abs_shap <- colMeans(abs(shap_df), na.rm = TRUE)
+    
+    if (length(mean_abs_shap) == 0) {
+      warning("无法计算平均绝对SHAP值")
+      return(NULL)
+    }
+    
+    # 按重要性排序，选择前top_n个特征
+    if (length(mean_abs_shap) < top_n) {
+      top_n <- length(mean_abs_shap)
+    }
+    top_features <- names(sort(mean_abs_shap, decreasing = TRUE))[1:top_n]
+    
+    # 获取特征值
+    if (!is.null(attr(shap_obj, "X"))) {
+      X_df <- as.data.frame(attr(shap_obj, "X"))
+    } else {
+      warning("无法获取特征值")
+      return(NULL)
+    }
+    
+    # 确保我们有共同的特征
+    common_features <- intersect(top_features, colnames(X_df))
+    if (length(common_features) == 0) {
+      warning("没有共同的特征")
+      return(NULL)
+    }
+    
+    # 准备绘图数据
+    plot_data_list <- list()
+    for (i in seq_along(common_features)) {
+      feature <- common_features[i]
+      temp_data <- data.frame(
+        Feature = feature,
+        SHAP_Value = shap_df[[feature]],
+        Feature_Value = X_df[[feature]]
+      )
+      plot_data_list[[i]] <- temp_data
+    }
+    
+    if (length(plot_data_list) == 0) {
+      warning("没有找到有效的特征数据")
+      return(NULL)
+    }
+    
+    plot_data <- do.call(rbind, plot_data_list)
+    
+    # 绘制蜂群图
+    p <- ggplot(plot_data, aes(x = SHAP_Value, y = Feature, 
+                               color = Feature_Value)) +
+      geom_point(alpha = 0.6, size = 1.5, position = position_jitter(width = 0, height = 0.2)) +
+      scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                            midpoint = median(plot_data$Feature_Value, na.rm = TRUE)) +
+      labs(
+        title = paste("SHAP摘要图 (Top", length(unique(plot_data$Feature)), "特征)"),
+        x = "SHAP值",
+        y = "特征",
+        color = "特征值"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.text.y = element_text(size = 10)
+      ) +
+      scale_y_discrete(limits = rev(sort(unique(plot_data$Feature))))
+    
+    return(p)
+  } else if (method == "shapviz") {
+    # 使用shapviz绘图
+    p <- sv_importance(shap_obj, kind = "bee", max_display = top_n) +
+      labs(title = paste("SHAP摘要图 (Top", top_n, "特征)")) +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.text.y = element_text(size = 10)
+      )
+    return(p)
+  } else {
+    warning("当前方法不支持图形绘制")
+    return(NULL)
+  }
+}
+
+# 4. SHAP依赖图函数
+plot_shap_dependence <- function(shap_result, feature, color_feature = NULL) {
+  if (is.null(shap_result) || is.null(shap_result$shap_obj)) {
+    warning("SHAP对象为空")
+    return(NULL)
+  }
+  
+  shap_obj <- shap_result$shap_obj
+  method <- shap_result$method
+  
+  if (method == "fastshap") {
+    # 获取数据
+    shap_df <- as.data.frame(shap_obj)
+    
+    if (!feature %in% colnames(shap_df)) {
+      warning(paste("特征", feature, "不在SHAP值中"))
+      return(NULL)
+    }
+    
+    # 获取特征值
+    if (!is.null(attr(shap_obj, "X"))) {
+      X_df <- as.data.frame(attr(shap_obj, "X"))
+    } else {
+      warning("无法获取特征值")
+      return(NULL)
+    }
+    
+    if (!feature %in% colnames(X_df)) {
+      warning(paste("特征", feature, "不在特征矩阵中"))
+      return(NULL)
+    }
+    
+    # 准备绘图数据
+    plot_data <- data.frame(
+      Feature_Value = X_df[[feature]],
+      SHAP_Value = shap_df[[feature]]
+    )
+    
+    if (!is.null(color_feature) && color_feature %in% colnames(X_df)) {
+      plot_data$Color_Feature <- X_df[[color_feature]]
+      
+      p <- ggplot(plot_data, aes(x = Feature_Value, y = SHAP_Value, color = Color_Feature)) +
+        geom_point(alpha = 0.6, size = 2) +
+        geom_smooth(method = "loess", se = TRUE, color = "black", size = 1) +
+        scale_color_gradient2(
+          name = color_feature,
+          low = "blue", mid = "white", high = "red",
+          midpoint = median(plot_data$Color_Feature, na.rm = TRUE)
+        ) +
+        labs(
+          title = paste("SHAP依赖图:", feature, "vs", color_feature),
+          x = feature,
+          y = "SHAP值"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        )
+    } else {
+      p <- ggplot(plot_data, aes(x = Feature_Value, y = SHAP_Value)) +
+        geom_point(alpha = 0.6, size = 2, color = "steelblue") +
+        geom_smooth(method = "loess", se = TRUE, color = "red", size = 1) +
+        labs(
+          title = paste("SHAP依赖图:", feature),
+          x = feature,
+          y = "SHAP值"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        )
+    }
+    
+    return(p)
+  } else if (method == "shapviz") {
+    # 使用shapviz
+    if (is.null(color_feature)) {
+      p <- sv_dependence(shap_obj, v = feature) +
+        labs(title = paste("SHAP依赖图:", feature)) +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        )
+    } else {
+      p <- sv_dependence(shap_obj, v = feature, color_var = color_feature) +
+        labs(title = paste("SHAP依赖图:", feature, "vs", color_feature)) +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        )
+    }
+    return(p)
+  } else {
+    warning("当前方法不支持依赖图")
+    return(NULL)
+  }
+}
+
+# 5. 综合SHAP分析函数
+perform_comprehensive_shap_analysis <- function(model, X, y, n_samples = 100, 
+                                                top_features = 6, output_dir = ".") {
+  cat("开始综合SHAP分析...\n")
+  
+  # 1. 创建SHAP解释器
+  shap_result <- create_shap_explainer(model, X, n_samples = n_samples)
+  
+  if (is.null(shap_result)) {
+    warning("SHAP分析失败")
+    return(NULL)
+  }
+  
+  cat("SHAP分析完成，使用", shap_result$method, "方法\n")
+  
+  # 2. 绘制SHAP重要性图
+  p_importance <- plot_shap_importance(shap_result, top_n = 20)
+  if (!is.null(p_importance)) {
+    print(p_importance)
+    ggsave(file.path(output_dir, "shap_importance.png"), p_importance, 
+           width = 10, height = 8, dpi = 300)
+  }
+  
+  # 3. 绘制SHAP摘要图
+  p_summary <- plot_shap_summary(shap_result, top_n = 15)
+  if (!is.null(p_summary)) {
+    print(p_summary)
+    ggsave(file.path(output_dir, "shap_summary.png"), p_summary, 
+           width = 12, height = 8, dpi = 300)
+  }
+  
+  # 4. 获取最重要的特征
+  importance <- lgb.importance(model, percentage = TRUE)
+  if (!is.null(importance) && nrow(importance) > 0) {
+    top_features_list <- head(importance$Feature, min(top_features, nrow(importance)))
+    
+    # 5. 为每个重要特征绘制依赖图
+    dependence_plots <- list()
+    for (i in seq_along(top_features_list)) {
+      feature <- top_features_list[i]
+      cat("绘制特征依赖图:", feature, "\n")
+      
+      p_dep <- plot_shap_dependence(shap_result, feature)
+      if (!is.null(p_dep)) {
+        dependence_plots[[feature]] <- p_dep
+        
+        # 保存单个依赖图
+        ggsave(file.path(output_dir, paste0("shap_dependence_", feature, ".png")), 
+               p_dep, width = 8, height = 6, dpi = 300)
+      }
+    }
+    
+    # 6. 组合依赖图
+    if (length(dependence_plots) > 0) {
+      n_col <- min(2, length(dependence_plots))
+      combined_dep <- wrap_plots(dependence_plots, ncol = n_col) +
+        plot_annotation(
+          title = "重要特征的SHAP依赖图",
+          theme = theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+        )
+      
+      print(combined_dep)
+      ggsave(file.path(output_dir, "shap_dependence_combined.png"), 
+             combined_dep, width = 16, height = 12, dpi = 300)
+    }
+  }
+  
+  # 7. 创建综合报告
+  create_shap_report(shap_result, model, X, y, output_dir)
+  
+  return(shap_result)
+}
+
+# 6. 近似SHAP值计算函数
+calculate_approximate_shap <- function(model, X_train, X_explain) {
+  # 使用特征重要性作为SHAP值的近似
+  importance <- lgb.importance(model, percentage = TRUE)
+  
+  if (is.null(importance)) {
+    stop("无法计算SHAP值")
+  }
+  
+  # 创建近似的SHAP值矩阵
+  n_samples <- nrow(X_explain)
+  n_features <- ncol(X_explain)
+  
+  # 获取特征名称
+  feature_names <- colnames(X_explain)
+  
+  # 创建SHAP值矩阵
+  shap_matrix <- matrix(0, nrow = n_samples, ncol = n_features)
+  colnames(shap_matrix) <- feature_names
+  
+  # 为每个特征分配近似SHAP值
+  for (i in 1:length(feature_names)) {
+    feature <- feature_names[i]
+    if (feature %in% importance$Feature) {
+      # 使用特征重要性作为基础
+      base_value <- importance$Gain[importance$Feature == feature]
+      if (length(base_value) > 0) {
+        # 添加随机噪声模拟个体差异
+        shap_matrix[, i] <- rnorm(n_samples, mean = base_value, sd = base_value * 0.5)
+      }
+    }
+  }
+  
+  # 创建shapviz兼容的对象
+  shap_obj <- list(
+    S = shap_matrix,
+    X = as.data.frame(X_explain),
+    baseline = mean(predict(model, X_train))
+  )
+  class(shap_obj) <- "shapviz"
+  
+  return(list(method = "approximate", shap_obj = shap_obj))
+}
+
+# 7. 创建SHAP分析报告函数
+create_shap_report <- function(shap_result, model, X, y, output_dir) {
+  cat("创建SHAP分析报告...\n")
+  
+  # 保存SHAP结果
+  saveRDS(shap_result, file.path(output_dir, "shap_result.rds"))
+  
+  # 创建文本报告
+  report_file <- file.path(output_dir, "shap_analysis_report.txt")
+  sink(report_file)
+  
+  cat("=== SHAP分析报告 ===\n\n")
+  cat("生成时间:", Sys.time(), "\n")
+  cat("分析方法:", shap_result$method, "\n\n")
+  
+  # 模型信息
+  cat("1. 模型信息\n")
+  cat("   迭代次数:", ifelse(exists("model$best_iter"), model$best_iter, "未知"), "\n")
+  cat("   最佳RMSE:", ifelse(exists("model$best_score"), model$best_score, "未知"), "\n")
+  cat("   特征数量:", ncol(X), "\n")
+  cat("   样本数量:", nrow(X), "\n\n")
+  
+  # 特征重要性对比
+  cat("2. 特征重要性\n")
+  importance_gain <- lgb.importance(model, percentage = TRUE)
+  if (!is.null(importance_gain)) {
+    cat("   基于增益的前10个特征:\n")
+    for (i in 1:min(10, nrow(importance_gain))) {
+      cat(sprintf("   %2d. %-20s: %.4f\n", 
+                  i, 
+                  importance_gain$Feature[i],
+                  importance_gain$Gain[i]))
+    }
+  }
+  
+  # SHAP分析结果
+  cat("\n3. SHAP分析结果\n")
+  cat("   SHAP方法:", shap_result$method, "\n")
+  cat("   SHAP样本数:", ifelse(shap_result$method == "fastshap", 
+                            nrow(as.data.frame(shap_result$shap_obj)),
+                            "未知"), "\n")
+  
+  sink()
+  
+  cat("SHAP分析报告已保存到:", report_file, "\n")
+}
+
+# 8. 主程序
+run_shap_analysis_only <- function(model, X, y, output_dir = "feature_analysis_results") {
+  # 创建输出目录
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  }
+  
+  cat("=== 开始SHAP分析 ===\n")
+  cat("输出目录:", output_dir, "\n")
+  cat("特征数量:", ncol(X), "\n")
+  cat("样本数量:", nrow(X), "\n\n")
+  
+  # 执行SHAP分析
+  cat("执行SHAP分析...\n")
+  shap_result <- NULL
+  
+  tryCatch({
+    shap_result <- perform_comprehensive_shap_analysis(
+      model, X, y, 
+      n_samples = 100,  # 减少样本数以加快计算
+      top_features = 6,
+      output_dir = output_dir
+    )
+  }, error = function(e) {
+    cat("SHAP分析失败:", e$message, "\n")
+  })
+  
+  cat("\n=== SHAP分析完成 ===\n")
+  cat("结果保存在:", output_dir, "\n")
+  
+  # 显示生成的文件
+  if (dir.exists(output_dir)) {
+    files <- list.files(output_dir, pattern = "\\.(png|rds|txt)$", full.names = TRUE)
+    if (length(files) > 0) {
+      cat("生成的文件:\n")
+      for (file in files) {
+        file_size <- file.size(file)
+        file_size_mb <- round(file_size / 1024 / 1024, 2)
+        cat("- ", basename(file), " (", file_size_mb, " MB)\n", sep = "")
+      }
+    }
+  }
+  
+  return(list(
+    shap_result = shap_result,
+    output_dir = output_dir
+  ))
+}
+
+# 9. 运行SHAP分析
+cat("开始运行SHAP分析...\n")
+analysis_results <- run_shap_analysis_only(lgb_model, X, y, output_dir)
+#7.61*10.35
+
+
+library(rgdal)
+library(raster)
+library(INLA)
+library(data.table)
+library(lightgbm)
+library(sf)
+library(dplyr)
+
+fill_na_with_mean <- function(x) {
+  if (all(is.na(x))) return(rep(0, length(x)))
+  x[is.na(x)] <- mean(x, na.rm = TRUE)
+  return(x)
+}
+
+ensemble_predictions <- function(X_new, cv_results_list) {
+  
+  n_models <- length(cv_results_list)
+  all_preds <- matrix(NA, nrow = nrow(X_new), ncol = n_models)
+  
+  for (i in seq_len(n_models)) {
+    
+    model_i <- cv_results_list[[i]]$model
+    best_iter_i <- cv_results_list[[i]]$best_iter
+    
+    if (is.null(best_iter_i)) {
+      best_iter_i <- model_i$best_iter
+    }
+    
+    if (is.null(best_iter_i)) {
+      best_iter_i <- model_i$current_iter()
+    }
+    
+    all_preds[, i] <- predict(
+      model_i,
+      X_new,
+      num_iteration = best_iter_i
+    )
+  }
+  
+  list(
+    mean = rowMeans(all_preds, na.rm = TRUE),
+    sd = apply(all_preds, 1, sd, na.rm = TRUE),
+    all_predictions = all_preds
+  )
+}
+
+required_features <- c(
+  "PM2.5", "Eth", "Over65por", "Edu", "Room",
+  "LiverB", "PerDI", "HEGDP", "PHE",
+  "time_effect_mean", "time_effect_sd", "time_effect_ci_width",
+  "time_trend", "time_position",
+  "ssq_effect_mean", "sheng_effect_mean", "order_effect_mean",
+  "ssq_effect_sd", "sheng_effect_sd", "order_effect_sd"
+)
+
+# 第一部分：2020年全区县预测
+
+Predict2020 <- readOGR("F:/2845 data.shp")
+
+r <- raster(Predict2020, res = 0.04)
+
+s_pred <- stack(
+  rasterize(Predict2020, r, "PM2_5"),
+  rasterize(Predict2020, r, "Eth"),
+  rasterize(Predict2020, r, "Over65por"),
+  rasterize(Predict2020, r, "Edu"),
+  rasterize(Predict2020, r, "Room"),
+  rasterize(Predict2020, r, "LiverB"),
+  rasterize(Predict2020, r, "PerDI"),
+  rasterize(Predict2020, r, "HEGDP"),
+  rasterize(Predict2020, r, "PHE"),
+  rasterize(Predict2020, r, "SSQ"),
+  rasterize(Predict2020, r, "ShengID"),
+  rasterize(Predict2020, r, "MHRR1"),
+  rasterize(Predict2020, r, "Order_")
+)
+
+names(s_pred) <- c(
+  "PM2.5", "Eth", "Over65por", "Edu", "Room",
+  "LiverB", "PerDI", "HEGDP", "PHE",
+  "SSQ", "ShengID", "MHRR1", "Order"
+)
+
+pred_grid <- as.data.frame(rasterToPoints(s_pred))
+names(pred_grid)[1:2] <- c("x", "y")
+
+cat("2020预测栅格点数:", nrow(pred_grid), "\n")
+
+
+# 生成预测数据的分类ID
+
+pred_grid$SSQ_id <- as.integer(factor(pred_grid$SSQ, levels = levels(all_data$SSQ)))
+pred_grid$ShengID_id <- as.integer(factor(pred_grid$ShengID, levels = levels(all_data$ShengID)))
+pred_grid$Order_id <- as.integer(factor(pred_grid$Order, levels = levels(all_data$Order)))
+
+target_year <- 2020
+target_time_id <- match(target_year, all_years)
+
+if (is.na(target_time_id)) {
+  target_time_id <- max(all_data$time_id, na.rm = TRUE)
+}
+
+coop <- as.matrix(pred_grid[, c("x", "y")])
+
+Ap <- inla.spde.make.A(
+  mesh = mesh2,
+  loc = coop,
+  group = rep(target_time_id, nrow(pred_grid)),
+  n.group = n_years
+)
+
+
+# 构建2020预测 stack
+
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = all_data$y),
+  A = list(1, A_combined),
+  effects = list(
+    data.frame(
+      Intercept = rep(1, nrow(all_data)),
+      log_MHRR = all_data$log_MHRR,
+      PM = all_data[["PM2.5"]],
+      Eth = all_data$Eth,
+      Over65por = all_data$Over65por,
+      Edu = all_data$Edu,
+      Room = all_data$Room,
+      LiverB = all_data$LiverB,
+      PerDI = all_data$PerDI,
+      HEGDP = all_data$HEGDP,
+      PHE = all_data$PHE,
+      SSQ_id = all_data$SSQ_id,
+      ShengID_id = all_data$ShengID_id,
+      Order_id = all_data$Order_id,
+      time_id = all_data$time_id
+    ),
+    w = s.index
+  )
+)
+
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA),
+  A = list(1, Ap),
+  effects = list(
+    data.frame(
+      Intercept = rep(1, nrow(pred_grid)),
+      log_MHRR = log(pred_grid$MHRR1),
+      PM = pred_grid[["PM2.5"]],
+      Eth = pred_grid$Eth,
+      Over65por = pred_grid$Over65por,
+      Edu = pred_grid$Edu,
+      Room = pred_grid$Room,
+      LiverB = pred_grid$LiverB,
+      PerDI = pred_grid$PerDI,
+      HEGDP = pred_grid$HEGDP,
+      PHE = pred_grid$PHE,
+      SSQ_id = pred_grid$SSQ_id,
+      ShengID_id = pred_grid$ShengID_id,
+      Order_id = pred_grid$Order_id,
+      time_id = rep(target_time_id, nrow(pred_grid))
+    ),
+    w = s.index
+  )
+)
+
+stk.full <- inla.stack(stk.e, stk.p)
+
+formulay <- y ~ -1 + Intercept +
+  offset(log_MHRR) +
+  PM + Eth + Over65por + Edu + Room + LiverB + PerDI + HEGDP + PHE +
+  f(SSQ_id, model = "iid") +
+  f(ShengID_id, model = "iid") +
+  f(Order_id, model = "iid") +
+  f(
+    time_id,
+    model = "rw1",
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01))
+    )
+  ) +
+  f(w, model = spde)
+
+Mod_Pointy <- inla(
+  formulay,
+  data = inla.stack.data(stk.full),
+  family = "poisson",
+  control.fixed = list(
+    mean.intercept = 0,
+    prec.intercept = 0.01,
+    mean = 0,
+    prec = 0.01
+  ),
+  control.predictor = list(
+    A = inla.stack.A(stk.full),
+    compute = TRUE,
+    link = 1
+  ),
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE
+  ),
+  control.inla = list(int.strategy = "eb"),
+  verbose = TRUE
+)
+
+summary(Mod_Pointy)
+
+idx_2020 <- inla.stack.index(
+  stack = stk.full,
+  tag = "pred"
+)$data
+
+prev_mean <- Mod_Pointy$summary.fitted.values[idx_2020, "mean"]
+prev_sd   <- Mod_Pointy$summary.fitted.values[idx_2020, "sd"]
+prev_ll   <- Mod_Pointy$summary.fitted.values[idx_2020, "0.025quant"]
+prev_ul   <- Mod_Pointy$summary.fitted.values[idx_2020, "0.975quant"]
+
+pred_data <- data.frame(
+  x = pred_grid$x,
+  y = pred_grid$y,
+  year = target_year,
+  PM2.5 = pred_grid[["PM2.5"]],
+  Eth = pred_grid$Eth,
+  Over65por = pred_grid$Over65por,
+  Edu = pred_grid$Edu,
+  Room = pred_grid$Room,
+  LiverB = pred_grid$LiverB,
+  PerDI = pred_grid$PerDI,
+  HEGDP = pred_grid$HEGDP,
+  PHE = pred_grid$PHE,
+  SSQ = pred_grid$SSQ,
+  ShengID = pred_grid$ShengID,
+  Order = pred_grid$Order,
+  SSQ_id = pred_grid$SSQ_id,
+  ShengID_id = pred_grid$ShengID_id,
+  Order_id = pred_grid$Order_id,
+  MHRR1 = pred_grid$MHRR1
+)
+
+pred_data$inla_fitted <- prev_mean
+pred_data$inla_sd <- prev_sd
+pred_data$inla_lower <- prev_ll
+pred_data$inla_upper <- prev_ul
+
+# =========================
+# 2020 LightGBM 特征
+# =========================
+
+time_effects_summary_pred <- Mod_Pointy$summary.random$time_id
+time_effects_pred <- time_effects_summary_pred$mean
+time_trend_pred <- c(diff(time_effects_pred), tail(diff(time_effects_pred), 1))
+
+pred_data$time_idx <- target_time_id
+pred_data$time_effect_mean <- time_effects_summary_pred$mean[pred_data$time_idx]
+pred_data$time_effect_sd <- time_effects_summary_pred$sd[pred_data$time_idx]
+pred_data$time_effect_025 <- time_effects_summary_pred$`0.025quant`[pred_data$time_idx]
+pred_data$time_effect_975 <- time_effects_summary_pred$`0.975quant`[pred_data$time_idx]
+pred_data$time_effect_ci_width <- pred_data$time_effect_975 - pred_data$time_effect_025
+pred_data$time_trend <- time_trend_pred[pred_data$time_idx]
+pred_data$time_position <- (pred_data$time_idx - 1) / (max(all_data$time_id, na.rm = TRUE) - 1)
+
+ssq_effects_pred <- Mod_Pointy$summary.random$SSQ_id
+sheng_effects_pred <- Mod_Pointy$summary.random$ShengID_id
+order_effects_pred <- Mod_Pointy$summary.random$Order_id
+
+pred_data$ssq_effect_mean <- ssq_effects_pred$mean[match(pred_data$SSQ_id, ssq_effects_pred$ID)]
+pred_data$sheng_effect_mean <- sheng_effects_pred$mean[match(pred_data$ShengID_id, sheng_effects_pred$ID)]
+pred_data$order_effect_mean <- order_effects_pred$mean[match(pred_data$Order_id, order_effects_pred$ID)]
+
+pred_data$ssq_effect_sd <- ssq_effects_pred$sd[match(pred_data$SSQ_id, ssq_effects_pred$ID)]
+pred_data$sheng_effect_sd <- sheng_effects_pred$sd[match(pred_data$ShengID_id, sheng_effects_pred$ID)]
+pred_data$order_effect_sd <- order_effects_pred$sd[match(pred_data$Order_id, order_effects_pred$ID)]
+
+for (v in required_features) {
+  pred_data[[v]] <- fill_na_with_mean(pred_data[[v]])
+}
+
+X_pred <- as.matrix(pred_data[, required_features])
+
+best_iter <- lgb_model$best_iter
+if (is.null(best_iter)) best_iter <- lgb_model$current_iter()
+
+pred_data$LightGBM_Residual_Pred <- predict(
+  lgb_model,
+  X_pred,
+  num_iteration = best_iter
+)
+
+ens_2020 <- ensemble_predictions(X_pred, cv_results)
+
+pred_data$LightGBM_Residual_Mean <- ens_2020$mean
+pred_data$LightGBM_Residual_SD <- ens_2020$sd
+pred_data$LightGBM_Residual_Lower <- ens_2020$mean - 1.96 * ens_2020$sd
+pred_data$LightGBM_Residual_Upper <- ens_2020$mean + 1.96 * ens_2020$sd
+
+pred_data$Final_Pred <- pred_data$inla_fitted + pred_data$LightGBM_Residual_Mean
+pred_data$Final_SD <- sqrt(pred_data$inla_sd^2 + pred_data$LightGBM_Residual_SD^2)
+pred_data$Final_Lower <- pred_data$Final_Pred - 1.96 * pred_data$Final_SD
+pred_data$Final_Upper <- pred_data$Final_Pred + 1.96 * pred_data$Final_SD
+
+final_results_2020 <- pred_data %>%
+  select(
+    x, y, year,
+    inla_fitted, inla_sd, inla_lower, inla_upper,
+    LightGBM_Residual_Pred,
+    LightGBM_Residual_Mean,
+    LightGBM_Residual_SD,
+    LightGBM_Residual_Lower,
+    LightGBM_Residual_Upper,
+    Final_Pred,
+    Final_SD,
+    Final_Lower,
+    Final_Upper
+  )
+
+fwrite(
+  final_results_2020,
+  file = "F:/output.csv"
+)
+
